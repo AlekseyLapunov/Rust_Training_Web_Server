@@ -1,20 +1,28 @@
 use core::fmt;
 use std::{
-    thread::{self, JoinHandle, },
+    thread::{self, JoinHandle},
     sync::{mpsc, Arc, Mutex},
+    error::Error
 };
 
+#[derive(Debug)]
 pub enum PoolCreationError {
     WrongPoolSize,
+    WorkerJobTrouble,
 }
 
 impl fmt::Display for PoolCreationError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let description = match *self {
             PoolCreationError::WrongPoolSize => "wrong thread pool size",
+            PoolCreationError::WorkerJobTrouble => "worker did not get a job",
         };
         f.write_str(description)
     }
+}
+
+impl Error for PoolCreationError {
+    
 }
 
 struct Worker {
@@ -22,8 +30,10 @@ struct Worker {
     thread: JoinHandle<()>,
 }
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
-        let thread = thread::spawn(move || loop { 
+    fn build(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Result<Worker, PoolCreationError> {
+        let builder = thread::Builder::new();
+
+        let thread = builder.spawn(move || loop { 
             let job = receiver.lock()
                 .expect(format!("Something went wrong: Worker {id} did not acquire a mutex").as_str()) // mutex can be poisoned so this line is vital
                 .recv() // receiving the job from the channel and it's blocking
@@ -31,10 +41,9 @@ impl Worker {
 
             println!("Worker {id} got a job! Executing;");
 
-            job(); 
-        }); // could be using builder for safety
+            job();}).map_err(|_| PoolCreationError::WorkerJobTrouble)?;
 
-        Worker { id, thread }
+        Ok(Worker { id, thread })
     }
 }
 
@@ -58,7 +67,7 @@ impl ThreadPool {
         let mut workers = Vec::with_capacity(size);
 
         for id in 0..size {
-            workers.push(Worker::new(id, Arc::clone(&receiver)));
+            workers.push(Worker::build(id, Arc::clone(&receiver))?);
         }
 
         Ok(ThreadPool { workers, sender })
