@@ -15,35 +15,39 @@ impl fmt::Display for PoolCreationError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let description = match *self {
             PoolCreationError::WrongPoolSize => "wrong thread pool size",
-            PoolCreationError::WorkerJobTrouble => "worker did not get a job",
+            PoolCreationError::WorkerJobTrouble => "worker did not get a job (problem thread spawning)",
         };
         f.write_str(description)
     }
 }
 
-impl Error for PoolCreationError {
-    
-}
+impl Error for PoolCreationError {}
 
 struct Worker {
     id: usize,
-    thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
 }
 impl Worker {
     fn build(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Result<Worker, PoolCreationError> {
         let builder = thread::Builder::new();
 
         let thread = builder.spawn(move || loop { 
-            let job = receiver.lock()
-                .expect(format!("Something went wrong: Worker {id} did not acquire a mutex").as_str()) // mutex can be poisoned so this line is vital
-                .recv() // receiving the job from the channel and it's blocking
-                .expect(format!("Something went wrong: Worker {id} did not get a job").as_str()); 
+            let message = receiver.lock().unwrap().recv();
 
-            println!("Worker {id} got a job! Executing;");
+            match message {
+                Ok(job) => {
+                    println!("Worker {id} got a job; executing.");
+                    job();
+                }
 
-            job();}).map_err(|_| PoolCreationError::WorkerJobTrouble)?;
+                Err(_) => {
+                    println!("Worker {id} disconnected; shutting down.");
+                    break;
+                }
+            }
+        }).map_err(|_| PoolCreationError::WorkerJobTrouble)?;
 
-        Ok(Worker { id, thread })
+        Ok(Worker { id, thread: Some(thread) })
     }
 }
 
@@ -51,7 +55,7 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: Option<mpsc::Sender<Job>>,
 }
 
 impl ThreadPool {
@@ -70,7 +74,7 @@ impl ThreadPool {
             workers.push(Worker::build(id, Arc::clone(&receiver))?);
         }
 
-        Ok(ThreadPool { workers, sender })
+        Ok(ThreadPool { workers, sender: Some(sender) })
     }
 
     pub fn execute<F>(&self, f: F)
@@ -79,6 +83,21 @@ impl ThreadPool {
     {
         let job = Box::new(f);
 
-        self.sender.send(job).unwrap();
+        self.sender.as_ref().unwrap().send(job).unwrap();
     }
 }
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
+
